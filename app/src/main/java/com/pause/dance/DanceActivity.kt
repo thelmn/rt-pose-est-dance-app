@@ -223,35 +223,32 @@ class DanceActivity : AppCompatActivity() {
     }
 
     private fun startSampleVideoPlayback() {
-        val videoAssetsFolder = File(baseContext.filesDir, VIDEO_ASSETS_FOLDER_NAME)
-
-        if (!videoAssetsFolder.isDirectory) {
-            val videos = applicationContext.assets.list(VIDEO_ASSETS_FOLDER_NAME)
-            if (!videos.isNullOrEmpty()) {
-                videoAssetsFolder.mkdirs()
-                for (video in videos) {
-                    val videoFile = File(videoAssetsFolder, video)
-                    copyStream(applicationContext.assets.open(video), videoFile.outputStream())
-                }
-            }
-            Log.d(TAG, "Copied ${videos?.size} video assets to $videoAssetsFolder")
+        val selectedVideo = selectedChallengeVideoFile()
+        if (selectedVideo == null) {
+            Log.e(TAG, "No sample video available for playback")
+            Toast.makeText(baseContext, "No sample video available", Toast.LENGTH_SHORT).show()
+            return
         }
 
-        videoAssetsFolder.listFiles()?.let { files ->
-            if (files.isNotEmpty()) {
-                // set first video file as sample video, verify file extension
-                for (file in files) {
-                    if (file.extension in listOf("mp4", "mkv")) {
-                        sampleVideoPath = file.absolutePath
-                        sampleVideoPlayer.setMediaItem(
-                            MediaItem.fromUri(file.toURI().toString())
-                        )
-                        sampleVideoPlayer.prepare()
-                        break
-                    }
-                }
-            }
+        sampleVideoPath = selectedVideo.absolutePath
+        sampleVideoPlayer.setMediaItem(MediaItem.fromUri(selectedVideo.toURI().toString()))
+        sampleVideoPlayer.prepare()
+    }
+
+    private fun selectedChallengeVideoFile(): File? {
+        intent.getStringExtra(EXTRA_VIDEO_PATH)
+            ?.let { File(it) }
+            ?.takeIf { it.isFile }
+            ?.let { return it }
+
+        val selectedChallengeId = intent.getStringExtra(EXTRA_CHALLENGE_ID)
+        val challengeRepository = ChallengeRepository(applicationContext)
+        if (selectedChallengeId != null) {
+            challengeRepository.getChallengeById(selectedChallengeId)?.let { return it.videoFile }
+            Log.e(TAG, "Selected challenge $selectedChallengeId was not found")
         }
+
+        return challengeRepository.getChallenges().firstOrNull()?.videoFile
     }
 
     private fun initSampleVideoTrackResults() {
@@ -476,12 +473,13 @@ class DanceActivity : AppCompatActivity() {
     companion object {
         private const val TAG = "DanceApp::DanceActivity"
 
-        private const val VIDEO_ASSETS_FOLDER_NAME = "videos"
         private const val VIDEO_TRACKRES_FOLDER_NAME = "video-track-res"
 
         private const val DETECTOR_MODEL_BASENAME = "rtmdet-n-fp16-ncnn"
         private const val POSE_MODEL_BASENAME = "rtmpose-t-body7-fp16-ncnn"
 
+        const val EXTRA_CHALLENGE_ID = "challengeId"
+        const val EXTRA_VIDEO_PATH = "videoPath"
 
         private var PERMISSIONS_REQUIRED = arrayOf(Manifest.permission.CAMERA)
 
