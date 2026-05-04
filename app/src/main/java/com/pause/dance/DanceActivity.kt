@@ -3,7 +3,6 @@ package com.pause.dance
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
-import android.graphics.PixelFormat
 import android.os.Bundle
 import android.util.Log
 import android.view.Surface
@@ -12,7 +11,6 @@ import android.widget.Button
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.CameraSelector
-import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
 import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionSelector
@@ -27,12 +25,10 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 import kotlinx.coroutines.guava.await
 import kotlinx.coroutines.launch
-import org.bytedeco.javacpp.Pointer
 import org.bytedeco.javacv.FFmpegFrameGrabber
 import org.bytedeco.javacv.Frame
 import org.bytedeco.javacv.OpenCVFrameConverter
 import org.bytedeco.opencv.global.opencv_core.CV_8U
-import org.bytedeco.opencv.global.opencv_core.CV_8UC4
 import org.bytedeco.opencv.global.opencv_imgproc.COLOR_RGBA2RGB
 import org.bytedeco.opencv.global.opencv_imgproc.cvtColor
 import org.bytedeco.opencv.opencv_core.Mat
@@ -65,6 +61,7 @@ class DanceActivity : AppCompatActivity() {
 
     private var poseTracker: mmdeploy.PoseTracker? = null
     private var poseTrackerStateHandle: Long? = null
+    private val poseTrackerLock = Any()
 
     init {
         Log.i(TAG, "Instantiated new " + this.javaClass)
@@ -109,6 +106,7 @@ class DanceActivity : AppCompatActivity() {
         // user could have removed them while the app was in paused state.
         if (!hasPermissions(this)) {
             requestPermissions(PERMISSIONS_REQUIRED, 1)
+            return
         }
 
         lifecycleScope.launch {
@@ -127,6 +125,9 @@ class DanceActivity : AppCompatActivity() {
         if (requestCode == 1) {
             if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
                 Log.d(TAG, "Camera permission granted")
+                lifecycleScope.launch {
+                    setupCamera()
+                }
             } else {
                 Log.d(TAG, "Camera permission denied")
             }
@@ -143,7 +144,6 @@ class DanceActivity : AppCompatActivity() {
     private var cameraProvider: ProcessCameraProvider? = null
     private var cameraPreview: Preview? = null
     private var videoCapture: VideoCapture<Recorder>? = null
-    private var frameAnalyzer: ImageAnalysis? = null
 
     private suspend fun setupCamera() {
         cameraProvider = ProcessCameraProvider.getInstance(this).await()
@@ -173,45 +173,12 @@ class DanceActivity : AppCompatActivity() {
             val recorder = Recorder.Builder().setExecutor(cameraRecorderExecutor).build()
             videoCapture = VideoCapture.withOutput(recorder)
 
-            frameAnalyzer = ImageAnalysis.Builder()
-                .setResolutionSelector(resolutionSelector)
-                .setTargetRotation(Surface.ROTATION_0)
-                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
-                .build()
-
-            frameAnalyzer?.setAnalyzer(frameAnalysisExecutor, { imageProxy ->
-                if (imageProxy.format != PixelFormat.RGBA_8888) {
-                    Log.e(
-                        TAG, "Expected image format ${PixelFormat.RGBA_8888}, " +
-                                "got ${imageProxy.format}"
-                    )
-                    imageProxy.close()
-                    return@setAnalyzer
-                }
-                Log.d(TAG, "Received image: ${imageProxy.width}x${imageProxy.height}")
-                val imageBuffer = imageProxy.planes[0].buffer
-
-                val mat = Mat(imageProxy.height, imageProxy.width, CV_8UC4, Pointer(imageBuffer))
-
-                val poseResults = applyPoseTracker(mat)
-                if (poseResults != null) {
-                    // val frameMat = visualizePose(mat, poseResults, COCO_VISUALIZATION_CONFIG)
-                    val poseResultJson = if (poseResults.isNotEmpty())
-                        poseResults[0].toJSON().toString()
-                    else "{}"
-                    Log.d(TAG, "Pose results: $poseResultJson")
-                }
-                imageProxy.close()
-            })
-
             try {
                 // Bind use cases to camera
                 cameraProvider.bindToLifecycle(
                     this, cameraSelector,
                     cameraPreview,
-                    videoCapture,
-                    frameAnalyzer
+                    videoCapture
                 )
 
                 Toast.makeText(baseContext, "Camera setup successful", Toast.LENGTH_SHORT).show()
@@ -281,7 +248,6 @@ class DanceActivity : AppCompatActivity() {
             Log.d(TAG, "Loaded track results from ${sampleVideoTrackResFile.absolutePath}")
             Log.d(TAG, "Track results: $trackResDataJSON")
 
-            val trackResTimestamps = trackResDataJSON.getJSONArray("timestamps")
             val trackResPoses = trackResDataJSON.getJSONArray("poseResults")
 
             val trackResults = List(trackResPoses.length()) { i ->
@@ -307,14 +273,14 @@ class DanceActivity : AppCompatActivity() {
 
         poseTracker ?: return null
 
-        var frame: Frame
         var frameMat: Mat
         val trackResults = mutableListOf<mmdeploy.PoseTracker.Result>()
         val trackResultsTimestamps = mutableListOf<Long>()
         val frameToMatConverter = OpenCVFrameConverter.ToMat()
         while (true) {
+            val frame: Frame
             try {
-                frame = grabber.grabImage()
+                frame = grabber.grabImage() ?: break
                 Log.d(
                     TAG,
                     "Grabbed frame from video capture for $sampleVideoUri, " +
@@ -464,8 +430,10 @@ class DanceActivity : AppCompatActivity() {
     private fun applyPoseTracker(frame: Mat): Array<mmdeploy.PoseTracker.Result>? {
         poseTracker?.let { poseTracker ->
             val mat = javaCVMatToMMDeployMat(frame)
-            val poseResults = poseTracker.apply(poseTrackerStateHandle!!, mat, -1)
-            return poseResults
+            val stateHandle = poseTrackerStateHandle ?: return null
+            return synchronized(poseTrackerLock) {
+                poseTracker.apply(stateHandle, mat, -1)
+            }
         }
         return null
     }
