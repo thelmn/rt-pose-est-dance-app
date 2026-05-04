@@ -8,6 +8,7 @@ import android.util.Log
 import android.view.Surface
 import android.view.WindowManager
 import android.widget.Button
+import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.CameraSelector
@@ -58,10 +59,17 @@ class DanceActivity : AppCompatActivity() {
     private lateinit var cameraPreviewView: PreviewView
 
     private lateinit var playButton: Button
+    private lateinit var sessionStatusView: TextView
 
     private var poseTracker: mmdeploy.PoseTracker? = null
     private var poseTrackerStateHandle: Long? = null
     private val poseTrackerLock = Any()
+
+    private var sessionState: PracticeSessionState = PracticeSessionState.Preparing
+    private var sampleVideoReady = false
+    private var cameraReady = false
+    private var poseTrackerReady = false
+    private var referenceTrackReady = false
 
     init {
         Log.i(TAG, "Instantiated new " + this.javaClass)
@@ -81,22 +89,58 @@ class DanceActivity : AppCompatActivity() {
 
         sampleVideoPlayer = ExoPlayer.Builder(this).build()
         sampleVideoPlayer.repeatMode = ExoPlayer.REPEAT_MODE_ALL
-        sampleVideoPlayer.playWhenReady = true
+        sampleVideoPlayer.playWhenReady = false
         sampleVideoPlayerView = findViewById(R.id.activity_dance_teacher_video_player)
         sampleVideoPlayerView.player = sampleVideoPlayer
 
         playButton = findViewById(R.id.activity_dance_play_button)
+        sessionStatusView = findViewById(R.id.activity_dance_session_status)
+
+        playButton.setOnClickListener {
+            handlePlayButtonClick()
+        }
+
+        setSessionState(PracticeSessionState.Preparing)
     }
 
     override fun onStart() {
         super.onStart()
 
-        startSampleVideoPlayback()
+        if (startSampleVideoPlayback()) {
+            sampleVideoReady = true
+            updateReadinessState()
+        }
 
         // run these in background
         Thread {
-            initPoseTracker()
-            initSampleVideoTrackResults()
+            try {
+                initPoseTracker()
+                runOnUiThread {
+                    poseTrackerReady = true
+                    updateReadinessState()
+                }
+
+                val trackResults = loadOrRunSampleVideoTrackResults()
+                sampleVideoTrackResults = trackResults
+                Log.d(TAG, "Initialized sample video track results: $sampleVideoTrackResults")
+                runOnUiThread {
+                    if (trackResults != null) {
+                        referenceTrackReady = true
+                        updateReadinessState()
+                    } else {
+                        setSessionState(
+                            PracticeSessionState.Error(
+                                "Reference pose setup failed"
+                            )
+                        )
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to prepare pose tracking", e)
+                runOnUiThread {
+                    setSessionState(PracticeSessionState.Error("Pose setup failed"))
+                }
+            }
         }.start()
     }
 
@@ -105,6 +149,7 @@ class DanceActivity : AppCompatActivity() {
         // Make sure that all permissions are still present, since the
         // user could have removed them while the app was in paused state.
         if (!hasPermissions(this)) {
+            setSessionState(PracticeSessionState.Preparing)
             requestPermissions(PERMISSIONS_REQUIRED, 1)
             return
         }
@@ -130,6 +175,7 @@ class DanceActivity : AppCompatActivity() {
                 }
             } else {
                 Log.d(TAG, "Camera permission denied")
+                setSessionState(PracticeSessionState.Error("Camera permission denied"))
             }
         }
     }
@@ -182,24 +228,28 @@ class DanceActivity : AppCompatActivity() {
                 )
 
                 Toast.makeText(baseContext, "Camera setup successful", Toast.LENGTH_SHORT).show()
-                playButton.visibility = Button.VISIBLE
+                cameraReady = true
+                updateReadinessState()
             } catch (e: Exception) {
                 Log.e(TAG, "Use case binding failed", e)
+                setSessionState(PracticeSessionState.Error("Camera setup failed"))
             }
         }
     }
 
-    private fun startSampleVideoPlayback() {
+    private fun startSampleVideoPlayback(): Boolean {
         val selectedVideo = selectedChallengeVideoFile()
         if (selectedVideo == null) {
             Log.e(TAG, "No sample video available for playback")
             Toast.makeText(baseContext, "No sample video available", Toast.LENGTH_SHORT).show()
-            return
+            setSessionState(PracticeSessionState.Error("No sample video available"))
+            return false
         }
 
         sampleVideoPath = selectedVideo.absolutePath
         sampleVideoPlayer.setMediaItem(MediaItem.fromUri(selectedVideo.toURI().toString()))
         sampleVideoPlayer.prepare()
+        return true
     }
 
     private fun selectedChallengeVideoFile(): File? {
@@ -216,11 +266,6 @@ class DanceActivity : AppCompatActivity() {
         }
 
         return challengeRepository.getChallenges().firstOrNull()?.videoFile
-    }
-
-    private fun initSampleVideoTrackResults() {
-        sampleVideoTrackResults = loadOrRunSampleVideoTrackResults()
-        Log.d(TAG, "Initialized sample video track results: $sampleVideoTrackResults")
     }
 
     private fun loadOrRunSampleVideoTrackResults(): List<mmdeploy.PoseTracker.Result>? {
@@ -436,6 +481,98 @@ class DanceActivity : AppCompatActivity() {
             }
         }
         return null
+    }
+
+    private fun updateReadinessState() {
+        if (sessionState is PracticeSessionState.Error || sessionState is PracticeSessionState.Playing) {
+            return
+        }
+
+        if (sampleVideoReady && cameraReady && poseTrackerReady && referenceTrackReady) {
+            setSessionState(PracticeSessionState.Ready)
+        } else {
+            setSessionState(PracticeSessionState.Preparing)
+        }
+    }
+
+    private fun handlePlayButtonClick() {
+        when (sessionState) {
+            PracticeSessionState.Ready,
+            PracticeSessionState.Paused,
+            PracticeSessionState.Completed -> {
+                sampleVideoPlayer.seekTo(0)
+                sampleVideoPlayer.play()
+                setSessionState(PracticeSessionState.Playing)
+            }
+
+            PracticeSessionState.Playing -> {
+                sampleVideoPlayer.pause()
+                setSessionState(PracticeSessionState.Paused)
+            }
+
+            else -> Unit
+        }
+    }
+
+    private fun setSessionState(state: PracticeSessionState) {
+        sessionState = state
+
+        val (message, buttonText, buttonEnabled) = when (state) {
+            PracticeSessionState.Preparing -> Triple(
+                readinessMessage(),
+                "Play",
+                false
+            )
+
+            PracticeSessionState.Ready -> Triple(
+                "Ready",
+                "Play",
+                true
+            )
+
+            PracticeSessionState.Playing -> Triple(
+                "Playing",
+                "Pause",
+                true
+            )
+
+            PracticeSessionState.Paused -> Triple(
+                "Paused",
+                "Resume",
+                true
+            )
+
+            PracticeSessionState.Completed -> Triple(
+                "Completed",
+                "Restart",
+                true
+            )
+
+            is PracticeSessionState.Error -> Triple(
+                state.message,
+                "Play",
+                false
+            )
+        }
+
+        sessionStatusView.text = message
+        playButton.text = buttonText
+        playButton.isEnabled = buttonEnabled
+        playButton.visibility = Button.VISIBLE
+    }
+
+    private fun readinessMessage(): String {
+        val pending = mutableListOf<String>()
+        if (!sampleVideoReady) pending.add("video")
+        if (!cameraReady) pending.add("camera")
+        if (!poseTrackerReady) pending.add("pose model")
+        if (!referenceTrackReady) pending.add("reference poses")
+
+        return if (pending.isEmpty()) {
+            "Preparing"
+        } else {
+            "Preparing: ${pending.joinToString(", ")}"
+        }
     }
 
     companion object {
