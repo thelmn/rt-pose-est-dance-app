@@ -72,10 +72,16 @@ class MainActivity : AppCompatActivity() {
         val title = TextView(this)
         title.text = challenge.title
         title.maxWidth = dp(150)
-        title.setPadding(dp(8), dp(8), dp(8), dp(8))
+        title.setPadding(dp(8), dp(8), dp(8), dp(2))
+
+        val difficulty = TextView(this)
+        difficulty.text = challenge.difficulty.displayName
+        difficulty.maxWidth = dp(150)
+        difficulty.setPadding(dp(8), 0, dp(8), dp(8))
 
         content.addView(thumbnail)
         content.addView(title)
+        content.addView(difficulty)
         card.addView(content)
 
         card.setOnClickListener {

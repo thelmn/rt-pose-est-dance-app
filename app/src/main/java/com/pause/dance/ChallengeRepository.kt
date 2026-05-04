@@ -7,8 +7,24 @@ import java.util.Locale
 data class Challenge(
     val id: String,
     val title: String,
+    val difficulty: Difficulty,
     val videoFile: File,
 )
+
+enum class Difficulty(val displayName: String) {
+    BEGINNER("Beginner"),
+    INTERMEDIATE("Intermediate"),
+    ADVANCED("Advanced"),
+    UNKNOWN("Unknown");
+
+    companion object {
+        fun fromLabel(label: String): Difficulty {
+            return entries.firstOrNull {
+                it.displayName.equals(label.trim(), ignoreCase = true)
+            } ?: UNKNOWN
+        }
+    }
+}
 
 class ChallengeRepository(private val context: Context) {
 
@@ -20,9 +36,11 @@ class ChallengeRepository(private val context: Context) {
             ?.filter { it.isFile && it.extension.lowercase(Locale.US) in SUPPORTED_VIDEO_EXTENSIONS }
             ?.sortedBy { it.name.lowercase(Locale.US) }
             ?.map { file ->
+                val metadata = ChallengeMetadata.fromFile(file)
                 Challenge(
                     id = file.nameWithoutExtension.toStableId(),
-                    title = file.nameWithoutExtension.toDisplayTitle(),
+                    title = metadata.title,
+                    difficulty = metadata.difficulty,
                     videoFile = file,
                 )
             }
@@ -56,13 +74,28 @@ class ChallengeRepository(private val context: Context) {
             .trim('-')
     }
 
-    private fun String.toDisplayTitle(): String {
-        return replace(Regex("\\s+-\\s+"), "\n")
-    }
-
     companion object {
         const val VIDEO_ASSETS_FOLDER_NAME = "videos"
 
         private val SUPPORTED_VIDEO_EXTENSIONS = setOf("mp4", "mkv")
+    }
+}
+
+private data class ChallengeMetadata(
+    val title: String,
+    val difficulty: Difficulty,
+) {
+    companion object {
+        fun fromFile(file: File): ChallengeMetadata {
+            val parts = file.nameWithoutExtension
+                .split(Regex("\\s+-\\s+"))
+                .map { it.trim() }
+                .filter { it.isNotEmpty() }
+
+            return ChallengeMetadata(
+                title = parts.firstOrNull() ?: file.nameWithoutExtension,
+                difficulty = parts.getOrNull(1)?.let(Difficulty::fromLabel) ?: Difficulty.UNKNOWN,
+            )
+        }
     }
 }
