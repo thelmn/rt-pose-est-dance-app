@@ -42,15 +42,15 @@ val COCO_VISUALIZATION_CONFIG = VisualizerConfig(
 
 fun visualizePose(
     frame: Mat,
-    poseResults: Array<mmdeploy.PoseTracker.Result>,
+    poseResults: List<PoseResult>,
     config: VisualizerConfig,
     threshold: Float = 0.5f
 ): Mat {
     for (pose in poseResults) {
-        val keyPointShown = BooleanArray(pose.keypoints.size, { false })
+        val keyPointShown = BooleanArray(pose.keypoints.size) { false }
         for (i in 0 until config.skeleton.size) {
             val pair = config.skeleton[i]
-            if (pose.scores[pair[0]] < threshold || pose.scores[pair[1]] < threshold) continue
+            if (pose.keypoints[pair[0]].score < threshold || pose.keypoints[pair[1]].score < threshold) continue
 
             val kp1 = pose.keypoints[pair[0]]
             val kp2 = pose.keypoints[pair[1]]
@@ -164,5 +164,4 @@ enum class COCODetClasses {
     HAIR_DRIER,
     TOOTHBRUSH,
 }
-
 

@@ -89,6 +89,7 @@ dependencies {
     implementation(libs.androidx.camera.camera2)
     annotationProcessor(libs.glide.compiler)
     testImplementation(libs.junit)
+    testImplementation("org.json:json:20240303")
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
 }

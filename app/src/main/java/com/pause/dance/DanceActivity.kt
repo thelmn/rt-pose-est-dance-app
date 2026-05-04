@@ -29,18 +29,11 @@ import kotlinx.coroutines.launch
 import org.bytedeco.javacv.FFmpegFrameGrabber
 import org.bytedeco.javacv.Frame
 import org.bytedeco.javacv.OpenCVFrameConverter
-import org.bytedeco.opencv.global.opencv_core.CV_8U
-import org.bytedeco.opencv.global.opencv_imgproc.COLOR_RGBA2RGB
-import org.bytedeco.opencv.global.opencv_imgproc.cvtColor
 import org.bytedeco.opencv.opencv_core.Mat
-import org.json.JSONArray
-import org.json.JSONObject
 import java.io.File
 import java.io.FileInputStream
-import java.io.FileOutputStream
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
-
 
 class DanceActivity : AppCompatActivity() {
 
@@ -53,17 +46,16 @@ class DanceActivity : AppCompatActivity() {
     private lateinit var sampleVideoPlayerView: PlayerView
     private lateinit var sampleVideoPlayer: ExoPlayer
 
-    private var sampleVideoPath: String? = null
-    private var sampleVideoTrackResults: List<mmdeploy.PoseTracker.Result>? = null
+    private var sampleVideoFile: File? = null
+    private var sampleVideoTrackFrames: List<PoseFrame>? = null
 
     private lateinit var cameraPreviewView: PreviewView
 
     private lateinit var playButton: Button
     private lateinit var sessionStatusView: TextView
 
-    private var poseTracker: mmdeploy.PoseTracker? = null
-    private var poseTrackerStateHandle: Long? = null
-    private val poseTrackerLock = Any()
+    private lateinit var poseTrackerEngine: PoseTrackerEngine
+    private lateinit var referencePoseTrackCache: LocalPoseTrackCache
 
     private var sessionState: PracticeSessionState = PracticeSessionState.Preparing
     private var sampleVideoReady = false
@@ -84,6 +76,8 @@ class DanceActivity : AppCompatActivity() {
 
         cameraRecorderExecutor = Executors.newSingleThreadExecutor()
         frameAnalysisExecutor = Executors.newSingleThreadExecutor()
+        poseTrackerEngine = MmdeployPoseTrackerEngine(applicationContext)
+        referencePoseTrackCache = LocalPoseTrackCache(filesDir)
 
         cameraPreviewView = findViewById(R.id.activity_dance_camera_preview)
 
@@ -111,20 +105,19 @@ class DanceActivity : AppCompatActivity() {
             updateReadinessState()
         }
 
-        // run these in background
         Thread {
             try {
-                initPoseTracker()
+                poseTrackerEngine.initialize(DEFAULT_POSE_MODEL_CONFIG)
                 runOnUiThread {
                     poseTrackerReady = true
                     updateReadinessState()
                 }
 
-                val trackResults = loadOrRunSampleVideoTrackResults()
-                sampleVideoTrackResults = trackResults
-                Log.d(TAG, "Initialized sample video track results: $sampleVideoTrackResults")
+                val trackFrames = loadOrRunSampleVideoTrackFrames()
+                sampleVideoTrackFrames = trackFrames
+                Log.d(TAG, "Initialized sample video track frames: $sampleVideoTrackFrames")
                 runOnUiThread {
-                    if (trackResults != null) {
+                    if (trackFrames != null) {
                         referenceTrackReady = true
                         updateReadinessState()
                     } else {
@@ -185,6 +178,8 @@ class DanceActivity : AppCompatActivity() {
 
         cameraRecorderExecutor.shutdown()
         frameAnalysisExecutor.shutdown()
+        poseTrackerEngine.close()
+        sampleVideoPlayer.release()
     }
 
     private var cameraProvider: ProcessCameraProvider? = null
@@ -220,7 +215,6 @@ class DanceActivity : AppCompatActivity() {
             videoCapture = VideoCapture.withOutput(recorder)
 
             try {
-                // Bind use cases to camera
                 cameraProvider.bindToLifecycle(
                     this, cameraSelector,
                     cameraPreview,
@@ -246,7 +240,7 @@ class DanceActivity : AppCompatActivity() {
             return false
         }
 
-        sampleVideoPath = selectedVideo.absolutePath
+        sampleVideoFile = selectedVideo
         sampleVideoPlayer.setMediaItem(MediaItem.fromUri(selectedVideo.toURI().toString()))
         sampleVideoPlayer.prepare()
         return true
@@ -268,219 +262,73 @@ class DanceActivity : AppCompatActivity() {
         return challengeRepository.getChallenges().firstOrNull()?.videoFile
     }
 
-    private fun loadOrRunSampleVideoTrackResults(): List<mmdeploy.PoseTracker.Result>? {
-        Log.d(TAG, "Loading or running sample video track results")
-        val sampleVideoUri = sampleVideoPath ?: return null
+    private fun loadOrRunSampleVideoTrackFrames(): List<PoseFrame>? {
+        Log.d(TAG, "Loading or running sample video track frames")
+        val videoFile = sampleVideoFile ?: return null
+        val challengeId = selectedChallengeId()
+        val sampleVideoTrackResFile = referencePoseTrackCache.cacheFile(videoFile)
 
-        val videoTrackResFolder = File(baseContext.filesDir, VIDEO_TRACKRES_FOLDER_NAME)
+        Log.d(TAG, "Sample video file: ${videoFile.absolutePath} exists: ${videoFile.exists()}")
+        Log.d(TAG, "Checking for sample video track results file: ${sampleVideoTrackResFile.absolutePath}")
 
-        val sampleVideoFile = File(sampleVideoUri)
-        val sampleVideoTrackResFile =
-            File(videoTrackResFolder, sampleVideoFile.nameWithoutExtension + ".json")
-
-        Log.d(
-            TAG,
-            "Sample video file: ${sampleVideoFile.absolutePath} exists: ${sampleVideoFile.exists()}"
-        )
-        Log.d(
-            TAG,
-            "Checking for sample video track results file: ${sampleVideoTrackResFile.absolutePath}"
-        )
-
-        if (sampleVideoTrackResFile.exists()) {
-            val trackResDataJSON = JSONObject(sampleVideoTrackResFile.readText())
-
+        referencePoseTrackCache.load(videoFile, challengeId, DEFAULT_POSE_MODEL_CONFIG)?.let { cachedFrames ->
             Log.d(TAG, "Loaded track results from ${sampleVideoTrackResFile.absolutePath}")
-            Log.d(TAG, "Track results: $trackResDataJSON")
-
-            val trackResPoses = trackResDataJSON.getJSONArray("poseResults")
-
-            val trackResults = List(trackResPoses.length()) { i ->
-                poseResultFromJSON(trackResPoses.getJSONObject(i))
-            }
-            return trackResults
+            return cachedFrames
         }
 
         Log.d(TAG, "Failed to load track results from ${sampleVideoTrackResFile.absolutePath}")
-        Log.d(TAG, "Running pose tracker on video file $sampleVideoUri")
-
-        // read video file and track poses using pose tracker
+        Log.d(TAG, "Running pose tracker on video file ${videoFile.absolutePath}")
 
         val grabber: FFmpegFrameGrabber
         try {
-            val sampleVideoInputStream = FileInputStream(sampleVideoUri)
+            val sampleVideoInputStream = FileInputStream(videoFile)
             grabber = FFmpegFrameGrabber(sampleVideoInputStream)
             grabber.start()
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to open video capture for $sampleVideoUri to track poses", e)
+            Log.e(TAG, "Failed to open video capture for ${videoFile.absolutePath} to track poses", e)
             return null
         }
 
-        poseTracker ?: return null
-
         var frameMat: Mat
-        val trackResults = mutableListOf<mmdeploy.PoseTracker.Result>()
-        val trackResultsTimestamps = mutableListOf<Long>()
+        val trackFrames = mutableListOf<PoseFrame>()
         val frameToMatConverter = OpenCVFrameConverter.ToMat()
-        while (true) {
-            val frame: Frame
-            try {
-                frame = grabber.grabImage() ?: break
-                Log.d(
-                    TAG,
-                    "Grabbed frame from video capture for $sampleVideoUri, " +
-                            "frame: ${frame.imageWidth}x${frame.imageHeight}x${frame.imageChannels}," +
-                            " ${frame.imageDepth} at ${frame.timestamp}"
-                )
+        try {
+            while (true) {
+                val frame: Frame
+                try {
+                    frame = grabber.grabImage() ?: break
+                    Log.d(
+                        TAG,
+                        "Grabbed frame from video capture for ${videoFile.absolutePath}, " +
+                                "frame: ${frame.imageWidth}x${frame.imageHeight}x${frame.imageChannels}," +
+                                " ${frame.imageDepth} at ${frame.timestamp}"
+                    )
 
-                frameMat = frameToMatConverter.convert(frame)
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to grab frame from video capture for $sampleVideoUri", e)
-                break
-            }
+                    frameMat = frameToMatConverter.convert(frame)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to grab frame from video capture for ${videoFile.absolutePath}", e)
+                    break
+                }
 
-            val poseResults = applyPoseTracker(frameMat)
-            if (poseResults != null) {
-                Log.d(TAG, "Tracked ${poseResults.size} poses from frame at ${frame.timestamp}")
-                trackResults.addAll(poseResults)
-                trackResultsTimestamps.add(frame.timestamp)
+                val poseFrame = poseTrackerEngine.track(frameMat, frame.timestamp)
+                Log.d(TAG, "Tracked ${poseFrame.poses.size} poses from frame at ${frame.timestamp}")
+                trackFrames.add(poseFrame)
             }
+        } finally {
+            runCatching { grabber.stop() }
+            runCatching { grabber.close() }
         }
-        Log.d(TAG, "Tracked ${trackResults.size} poses and " +
-                "${trackResultsTimestamps.size} timestamps from video file $sampleVideoUri")
 
-        val trackResDataJSON = poseResultsToJSON(trackResults, trackResultsTimestamps)
-        sampleVideoTrackResFile.parentFile?.mkdirs()
-        sampleVideoTrackResFile.createNewFile()
-        sampleVideoTrackResFile.writeText(trackResDataJSON.toString())
+        Log.d(
+            TAG,
+            "Tracked ${trackFrames.sumOf { it.poses.size }} poses across " +
+                    "${trackFrames.size} frames from video file ${videoFile.absolutePath}"
+        )
+
+        referencePoseTrackCache.save(videoFile, challengeId, DEFAULT_POSE_MODEL_CONFIG, trackFrames)
         Log.d(TAG, "Saved track results to ${sampleVideoTrackResFile.absolutePath}")
-        Log.d(TAG, "Track results: $trackResDataJSON")
 
-        return trackResults
-    }
-
-    private fun loadDetectorModel(): mmdeploy.Model {
-        // Load detector model
-        val detectorModelFolder = File(baseContext.filesDir, DETECTOR_MODEL_BASENAME)
-
-        if (!detectorModelFolder.isDirectory) {
-            Log.d(TAG, "Detector model directory ${detectorModelFolder.absolutePath} " +
-                    "not found. Unzipping...")
-
-            val detectorModelZipName = "${DETECTOR_MODEL_BASENAME}.zip"
-            val detectorModelZipInStream = applicationContext.assets.open(detectorModelZipName)
-            val detectorModelZipOutFile = File(applicationContext.filesDir, detectorModelZipName)
-
-            copyStream(detectorModelZipInStream, FileOutputStream(detectorModelZipOutFile))
-            unzip(detectorModelZipOutFile, detectorModelFolder)
-        }
-
-        Log.d(
-            TAG,
-            "Loading detector model from directory ${detectorModelFolder.absolutePath}, " +
-                    "${detectorModelFolder.isDirectory}, ${detectorModelFolder.listFiles()}"
-        )
-
-        // TODO: initialize only once globally
-        val detectorModel = mmdeploy.Model(detectorModelFolder.absolutePath)
-        Log.d(TAG, "Loaded detector model")
-
-        return detectorModel
-    }
-
-    private fun loadPoseModel(): mmdeploy.Model {
-        // Load pose detector model
-        val poseModelFolder = File(baseContext.filesDir, POSE_MODEL_BASENAME)
-
-        if (!poseModelFolder.isDirectory) {
-            Log.d(
-                TAG,
-                "Pose model directory ${poseModelFolder.absolutePath} not found. Unzipping..."
-            )
-            val poseModelZipName = "${POSE_MODEL_BASENAME}.zip"
-            val poseModelZipInStream = applicationContext.assets.open(poseModelZipName)
-            val poseModelZipOutFile = File(applicationContext.filesDir, poseModelZipName)
-
-            copyStream(poseModelZipInStream, FileOutputStream(poseModelZipOutFile))
-            unzip(poseModelZipOutFile, poseModelFolder)
-        }
-
-        Log.d(
-            TAG,
-            "Loading pose model from directory ${poseModelFolder.absolutePath}, " +
-                    "${poseModelFolder.isDirectory}, ${poseModelFolder.listFiles()}"
-        )
-
-        val poseModel = mmdeploy.Model(poseModelFolder.absolutePath)
-        Log.d(TAG, "Loaded pose model")
-
-        return poseModel
-    }
-
-    private fun initPoseTracker() {
-        val detectorModel = loadDetectorModel()
-        val poseModel = loadPoseModel()
-
-        val poseCtx = mmdeploy.Context()
-        poseCtx.add(mmdeploy.Device("cpu", 0))
-        // poseCtx.add()  // TODO: use scheduler
-        poseTracker = mmdeploy.PoseTracker(detectorModel, poseModel, poseCtx)
-        Log.d(TAG, "Loaded pose tracker")
-
-        val poseTrackerParam = poseTracker!!.initParams()
-        Log.d(TAG, "Initialized pose tracker default params: ${poseTrackerParam.toMap()}")
-        poseTrackerParam.detInterval = 1
-        poseTrackerParam.detLabel = COCODetClasses.PERSON.ordinal
-        poseTrackerParam.detThr = 0.5F
-        poseTrackerParam.detMinBboxSize = 100F
-        poseTrackerParam.keypointSigmas = COCO_VISUALIZATION_CONFIG.sigmas.toFloatArray()
-
-        poseTrackerStateHandle = poseTracker!!.createState(poseTrackerParam)
-    }
-
-    private val threadLocalFrameRGB = ThreadLocal.withInitial { Mat() }
-    private val threadLocalFrame8U = ThreadLocal.withInitial { Mat() }
-    private val threadLocalFrameByteArray = ThreadLocal.withInitial { ByteArray(0) }
-
-    private fun javaCVMatToMMDeployMat(frameIn: Mat): mmdeploy.Mat {
-        var frame = frameIn
-
-        val frameRGB = threadLocalFrameRGB.get() ?: Mat()
-        cvtColor(frame, frameRGB, COLOR_RGBA2RGB)
-        threadLocalFrameRGB.set(frameRGB)
-        frame = frameRGB
-
-        if (frame.depth() != CV_8U) {
-            Log.d(TAG, "Converting frame from depth ${frame.depth()} to $CV_8U")
-            val frame8U = threadLocalFrame8U.get() ?: Mat()
-            frame.convertTo(frame8U, CV_8U)
-            threadLocalFrame8U.set(frame8U)
-            frame = frame8U
-        }
-
-        var frameByteArray = threadLocalFrameByteArray.get() ?: ByteArray(0)
-        if (frameByteArray.size != (frame.total() * frame.channels()).toInt()) {
-            frameByteArray = ByteArray((frame.total() * frame.channels()).toInt())
-            threadLocalFrameByteArray.set(frameByteArray)
-        }
-        frame.data().get(frameByteArray)
-
-        return mmdeploy.Mat(
-            frame.rows(), frame.cols(), frame.channels(),
-            mmdeploy.PixelFormat.RGB, mmdeploy.DataType.INT8,
-            frameByteArray
-        )
-    }
-
-    private fun applyPoseTracker(frame: Mat): Array<mmdeploy.PoseTracker.Result>? {
-        poseTracker?.let { poseTracker ->
-            val mat = javaCVMatToMMDeployMat(frame)
-            val stateHandle = poseTrackerStateHandle ?: return null
-            return synchronized(poseTrackerLock) {
-                poseTracker.apply(stateHandle, mat, -1)
-            }
-        }
-        return null
+        return trackFrames
     }
 
     private fun updateReadinessState() {
@@ -575,13 +423,22 @@ class DanceActivity : AppCompatActivity() {
         }
     }
 
+    private fun selectedChallengeId(): String {
+        return intent.getStringExtra(EXTRA_CHALLENGE_ID)
+            ?: sampleVideoFile?.nameWithoutExtension
+            ?: "unknown"
+    }
+
     companion object {
         private const val TAG = "DanceApp::DanceActivity"
 
-        private const val VIDEO_TRACKRES_FOLDER_NAME = "video-track-res"
-
-        private const val DETECTOR_MODEL_BASENAME = "rtmdet-n-fp16-ncnn"
-        private const val POSE_MODEL_BASENAME = "rtmpose-t-body7-fp16-ncnn"
+        private val DEFAULT_POSE_MODEL_CONFIG = PoseModelConfig(
+            detectorId = "rtmdet-n-fp16-ncnn",
+            poseId = "rtmpose-t-body7-fp16-ncnn",
+            backend = "ncnn",
+            precision = "fp16",
+            keypointSet = "body7"
+        )
 
         const val EXTRA_CHALLENGE_ID = "challengeId"
         const val EXTRA_VIDEO_PATH = "videoPath"
@@ -592,96 +449,4 @@ class DanceActivity : AppCompatActivity() {
             ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED
         }
     }
-}
-
-fun mmdeploy.PoseTracker.Params.toMap(): Map<String, Any> {
-    return mapOf(
-        "detInterval" to detInterval,
-        "detLabel" to detLabel,
-        "detThr" to detThr,
-        "detMinBboxSize" to detMinBboxSize,
-        "detNmsThr" to detNmsThr,
-        "poseMaxNumBboxes" to poseMaxNumBboxes,
-        "poseKptThr" to poseKptThr,
-        "poseMinKeypoints" to poseMinKeypoints,
-        "poseBboxScale" to poseBboxScale,
-        "poseMinBboxSize" to poseMinBboxSize,
-        "poseNmsThr" to poseNmsThr,
-        "keypointSigmas" to keypointSigmas,
-        "keypointSigmasSize" to keypointSigmasSize,
-        "trackIouThr" to trackIouThr,
-        "trackMaxMissing" to trackMaxMissing,
-        "trackHistorySize" to trackHistorySize,
-        "stdWeightPosition" to stdWeightPosition,
-        "stdWeightVelocity" to stdWeightVelocity,
-        "smoothParams" to smoothParams
-    )
-}
-
-fun poseResultFromJSON(poseResult: org.json.JSONObject): mmdeploy.PoseTracker.Result {
-    val keypoints = poseResult.getJSONArray("keypoints")
-    val keypointsArray = Array(keypoints.length()) { i ->
-        val keypoint = keypoints.getJSONObject(i)
-        mmdeploy.PointF(
-            keypoint.getDouble("x").toFloat(),
-            keypoint.getDouble("y").toFloat()
-        )
-    }
-
-    val scores = poseResult.getJSONArray("scores")
-    val scoresArray = FloatArray(scores.length()) { i -> scores.getDouble(i).toFloat() }
-
-    val bbox = poseResult.getJSONObject("bbox")
-    val bboxRect = mmdeploy.Rect(
-        bbox.getDouble("left").toFloat(), bbox.getDouble("top").toFloat(),
-        bbox.getDouble("right").toFloat(), bbox.getDouble("bottom").toFloat()
-    )
-
-    val targetID = poseResult.getInt("targetID")
-
-    return mmdeploy.PoseTracker.Result(keypointsArray, scoresArray, bboxRect, targetID)
-}
-
-fun mmdeploy.PoseTracker.Result.toJSON(): JSONObject {
-    val keypoints = JSONArray()
-    this.keypoints.forEach { keypoint ->
-        val keypointJSON = JSONObject()
-        keypointJSON.put("x", keypoint.x.toDouble())
-        keypointJSON.put("y", keypoint.y.toDouble())
-        keypoints.put(keypointJSON)
-    }
-
-    val scores = JSONArray()
-    this.scores.forEach { score -> scores.put(score.toDouble()) }
-
-    val bbox = JSONObject()
-    bbox.put("left", this.bbox.left.toDouble())
-    bbox.put("top", this.bbox.top.toDouble())
-    bbox.put("right", this.bbox.right.toDouble())
-    bbox.put("bottom", this.bbox.bottom.toDouble())
-
-    val poseResult = JSONObject()
-    poseResult.put("keypoints", keypoints)
-    poseResult.put("scores", scores)
-    poseResult.put("bbox", bbox)
-    poseResult.put("targetID", this.targetID)
-
-    return poseResult
-}
-
-fun poseResultsToJSON(
-    poseResults: List<mmdeploy.PoseTracker.Result>,
-    timestamps: List<Long>
-): JSONObject {
-    val poseResultsJSON = JSONArray()
-    poseResults.forEach { poseResult -> poseResultsJSON.put(poseResult.toJSON()) }
-
-    val timestampsJSON = JSONArray()
-    timestamps.forEach { timestamp -> timestampsJSON.put(timestamp) }
-
-    val trackResData = JSONObject()
-    trackResData.put("timestamps", timestampsJSON)
-    trackResData.put("poseResults", poseResultsJSON)
-
-    return trackResData
 }
